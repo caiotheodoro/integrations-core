@@ -101,7 +101,15 @@ def test_correlate_ignores_artifact_dir_missing_on_disk(tmp_path: Path):
     assert result.artifact_name_path is None
 
 
-def _workflow(batch_id: str, run_id: int, success: int, failed: int, skipped: int, results: list) -> WorkflowStatus:
+def _workflow(
+    batch_id: str,
+    run_id: int,
+    success: int,
+    failed: int,
+    skipped: int,
+    results: list,
+    cancelled: int = 0,
+) -> WorkflowStatus:
     return WorkflowStatus(
         batch_id=batch_id,
         url=f"https://example/runs/{run_id}",
@@ -109,6 +117,7 @@ def _workflow(batch_id: str, run_id: int, success: int, failed: int, skipped: in
         success_count=success,
         failed_count=failed,
         skipped_count=skipped,
+        cancelled_count=cancelled,
         results=results,
     )
 
@@ -119,3 +128,6 @@ def test_workflow_status_label():
     assert _workflow("b3", 3, 0, 0, 2, []).status == Status.SKIPPED
     # A batch with passes and skips (no failures) reads as success.
     assert _workflow("b4", 4, 3, 0, 1, []).status == Status.SUCCESS
+    assert _workflow("b5", 5, 0, 0, 0, [], cancelled=2).status == Status.CANCELLED
+    assert _workflow("b6", 6, 1, 0, 1, [], cancelled=1).status == Status.CANCELLED
+    assert _workflow("b7", 7, 0, 1, 0, [], cancelled=1).status == Status.FAILURE

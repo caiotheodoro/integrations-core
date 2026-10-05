@@ -153,13 +153,16 @@ class WorkflowStatus:
     success_count: int
     failed_count: int
     skipped_count: int
+    cancelled_count: int
     results: list[JobResult]
 
     @property
     def status(self) -> Status:
-        """Batch-level label: FAILURE if any job failed, else SUCCESS if any passed, else SKIPPED."""
+        """Batch-level label, ranked like the run outcome: FAILURE, then CANCELLED, then SUCCESS, else SKIPPED."""
         if self.failed_count > 0:
             return Status.FAILURE
+        if self.cancelled_count > 0:
+            return Status.CANCELLED
         if self.success_count > 0:
             return Status.SUCCESS
         return Status.SKIPPED

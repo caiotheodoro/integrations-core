@@ -457,6 +457,13 @@ SECTION_MARKERS = (
             ),
         ),
         (
+            "cancelled",
+            DispatcherProgress(
+                batches=(batch_progress("batch-01", job_progress(attempt(Status.CANCELLED)), status=Status.CANCELLED),),
+                done=True,
+            ),
+        ),
+        (
             "incomplete",
             DispatcherProgress(
                 batches=(batch_progress("batch-01", _kuma_target()),),
@@ -1246,6 +1253,30 @@ def test_a_real_failure_outranks_a_missing_result():
     assert "## ❌ Dispatcher tests: failed" in render_comment(progress)
 
 
+def test_a_real_failure_outranks_a_cancelled_batch():
+    """A run with a failed and a cancelled batch is a failed run, matching the run outcome."""
+    progress = DispatcherProgress(
+        batches=(
+            batch_progress(
+                "batch-01",
+                job_progress(attempt(Status.FAILURE), target="nginx"),
+                status=Status.FAILURE,
+            ),
+            batch_progress(
+                "batch-02", job_progress(attempt(Status.CANCELLED), target="kafka"), status=Status.CANCELLED
+            ),
+        ),
+        done=True,
+    )
+
+    body = render_comment(progress)
+
+    assert "## ❌ Dispatcher tests: failed" in body
+    assert CANCELLED_HEADING not in body
+    # The cancelled batch still carries its own chip, so the reader can see which one to rerun.
+    assert "🚫 [batch-02]" in _batch_strip_of(body)
+
+
 def test_a_missing_result_is_not_counted_as_a_failed_integration():
     """The group renders as a warning, so counting it as a failure would contradict the body."""
     progress = DispatcherProgress(
@@ -1329,6 +1360,46 @@ def test_skipped_is_shown_only_when_non_zero():
 
     assert "⏭️ 1 skipped" in render_comment(progress)
     assert "skipped" not in render_comment(uniform_progress(done=True))
+
+
+def test_a_cancelled_batch_reads_as_cancelled_neither_passed_nor_failed():
+    """A superseded run's batch is its own outcome: the heading says cancelled, and no cancelled
+    job is counted or listed as a failure."""
+    progress = DispatcherProgress(
+        batches=(
+            batch_progress(
+                "batch-01",
+                job_progress(attempt(), target="ntp"),
+                job_progress(attempt(Status.CANCELLED), target="kafka"),
+                status=Status.CANCELLED,
+            ),
+        ),
+        done=True,
+    )
+
+    body = render_comment(progress)
+
+    # The same heading a shutdown-cancelled run uses: either way the run ended by cancellation.
+    assert CANCELLED_HEADING in body
+    assert _batch_strip_of(body).startswith(f"Batches · 🚫 [batch-01]({BATCH_RUN_URL}) 2/2")
+    assert "✅ 1 passed" in body
+    assert "🚫 1 cancelled" in body
+    assert "❌" not in body
+    assert "nothing failed" not in body
+    assert _group_summaries_of(body) == []
+    assert _target_rows_of(body) == []
+    # A cancelled job drew no verified result, so it takes the pending colour like an inconclusive one.
+    assert set(_progress_bar_of(body)) == {"passed", "pending"}
+
+
+def test_cancelled_is_shown_only_when_non_zero():
+    cancelled = DispatcherProgress(
+        batches=(batch_progress("batch-01", job_progress(attempt(Status.CANCELLED), target="ntp")),),
+        done=True,
+    )
+
+    assert "🚫 1 cancelled" in render_comment(cancelled)
+    assert "cancelled" not in render_comment(uniform_progress(done=True))
 
 
 def test_an_inconclusive_job_is_listed_and_warns_its_batch():

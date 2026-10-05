@@ -984,8 +984,16 @@ def test_an_executed_run_reports_its_execution_metrics(
             'jobs.incomplete': 1,
             'batches.passed': 1,
             'batches.failed': 1,
+            'batches.skipped': 1,
+            'batches.cancelled': 1,
+            'batches.inconclusive': 1,
+            'jobs.passed': 1,
             'jobs.failed': 1,
             'jobs.skipped': 1,
+            'jobs.cancelled': 1,
+            'jobs.inconclusive': 1,
+            'jobs.timed_out': 1,
+            'batches.timed_out': 1,
         }
     )
     assert run_outcome_counts(sink) == only_outcome('runs.passed')
@@ -1053,6 +1061,40 @@ def test_a_run_with_failed_tests_is_counted_as_a_test_failure(
     assert failed[0].tags['dispatcher.batch.job.target'] == 'ntp'
     assert [record.value for record in sink.records_named('jobs.incomplete')] == [0]
     assert [record.value for record in sink.records_named('jobs.skipped')] == [0]
+
+
+def test_a_superseded_run_whose_batches_were_cancelled_is_counted_as_cancelled(
+    ddev: CliRunner,
+    github: FakeAsyncGitHubClient,
+    planned: MagicMock,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    step_summary: Path,
+):
+    """A run that observes its batches cancelled by a superseding push ends cancelled, not failed."""
+    job = planned.return_value[0].job_list[0]
+    mock_job_result(github, job, 'cancelled')
+    github.mock_response(
+        'get_workflow_run',
+        make_workflow_run(name='test-batch', conclusion='cancelled'),
+    )
+    sink = recording_runtime(mocker)
+    fast_dispatcher_config(mocker)
+    monkeypatch.setattr('ddev.utils.github_async.AsyncGitHubClient', lambda token, rate_limiter=None, **kwargs: github)
+
+    result = ddev('ci', 'dispatch-tests', '--pr', str(PR_NUMBER), '--output-dir', str(tmp_path))
+
+    assert result.exit_code == 1, result.output
+    assert 'Dispatcher tests were cancelled.' in result.output
+    assert 'Dispatcher tests failed.' not in result.output
+    assert [record.value for record in sink.records_named('runs.count')] == [1]
+    assert run_outcome_counts(sink) == only_outcome('runs.cancelled')
+    assert [record.value for record in sink.records_named('batches.cancelled')] == [1]
+    assert [record.value for record in sink.records_named('batches.failed')] == [0]
+    assert [record.value for record in sink.records_named('jobs.cancelled')] == [1]
+    assert [record.value for record in sink.records_named('jobs.failed')] == [0]
+    assert [record.value for record in sink.records_named('jobs.incomplete')] == [0]
 
 
 def test_a_run_whose_final_report_fails_is_counted_failed_without_invented_job_outcomes(

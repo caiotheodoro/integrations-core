@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from ddev.cli.ci.tests import messages
+from ddev.cli.ci.tests import messages, task_test_gatherer
 from ddev.cli.ci.tests.messages import (
     BatchFinished,
     BatchJob,
@@ -41,11 +41,13 @@ from ddev.utils.github_async.models import WorkflowJob, WorkflowJobConclusion, W
 from ddev.utils.junit import TestStatus
 from ddev.utils.platform import PlatformName
 from tests.cli.ci.tests.helpers import (
+    OUTCOME_COUNTERS,
     RecordingBus,
     drain_queue,
     jobs_reported,
     make_job,
     recording_runtime,
+    timed_out_job,
 )
 from tests.helpers.github_async import (
     FakeAsyncGitHubClient,
@@ -208,17 +210,35 @@ def _progress_update(
     sequence: int = 1,
     state: ExecutionState = ExecutionState.RUNNING,
     status: Status | None = None,
+    batch_id: str = "batch-1",
+    run_id: int = 100,
 ) -> messages.BatchProgressUpdate:
     return messages.BatchProgressUpdate(
         id=f"progress-{sequence}",
-        batch_id="batch-1",
-        run_id=100,
-        workflow_url="https://github.com/o/r/actions/runs/100",
+        batch_id=batch_id,
+        run_id=run_id,
+        workflow_url=f"https://github.com/o/r/actions/runs/{run_id}",
         sequence=sequence,
         state=state,
         status=status,
         jobs=tuple(jobs),
     )
+
+
+def _counted_jobs(sink) -> dict[str, str]:
+    """Each job's counted outcome, keyed by target: the dense family's one 1 per job."""
+    return {
+        record.tags["dispatcher.batch.job.target"]: record.name.removeprefix("jobs.")
+        for record in sink.records
+        if record.name.startswith("jobs.") and record.value == 1
+    }
+
+
+def _launched(*jobs: BatchJob, batch_id: str = "batch-1", run_id: int = 100) -> TestBatch:
+    """A batch the runner dispatched, as the Dispatcher hands it to the shutdown accounting."""
+    batch = _test_batch(batch_id, list(jobs))
+    batch.run_id = run_id
+    return batch
 
 
 def test_progress_observations_update_planned_jobs_and_suppress_equal_snapshots(tmp_path: Path):
@@ -458,8 +478,8 @@ def test_happy_path_organizes_artifacts_and_emits_update(tmp_path: Path):
     assert (tmp_path / "out" / "test_results" / "ntp_py3.13_linux-test-e2e-py3.13.xml").is_file()
 
 
-def test_an_accepted_final_result_reports_the_batches_outcomes(tmp_path: Path):
-    """An accepted commit reports its batch's outcome and a zero-filled flag per collected job."""
+def test_an_accepted_final_result_reports_the_batches_dense_outcomes(tmp_path: Path):
+    """A batch reports one dense family of outcome counters, whatever its own conclusion says."""
     monitoring, sink = recording_runtime()
     j1 = _batch_job("j1")
     j2 = _batch_job("j2", target="kafka")
@@ -483,18 +503,11 @@ def test_an_accepted_final_result_reports_the_batches_outcomes(tmp_path: Path):
     )
 
     drain_queue(gatherer.bus.queue)
-    assert [record.value for record in sink.records_named("batches.passed")] == [0]
-    assert [record.value for record in sink.records_named("batches.failed")] == [1]
-    failed = [
-        (record.value, record.tags["dispatcher.batch.job.target"]) for record in sink.records_named("jobs.failed")
-    ]
-    assert failed == [(1, "ntp"), (0, "kafka"), (0, "redis")]
-    skipped = [
-        (record.value, record.tags["dispatcher.batch.job.target"]) for record in sink.records_named("jobs.skipped")
-    ]
-    assert skipped == [(0, "ntp"), (1, "kafka"), (0, "redis")]
-    assert {record.tags["dispatcher.component"] for record in sink.records_named("jobs.failed")} == {"test-gatherer"}
-    assert sink.records_named("jobs.incomplete") == []
+    for name in OUTCOME_COUNTERS:
+        records = sink.records_named(f"batches.{name}")
+        assert [record.value for record in records] == [int(name == "failed")], name
+    # Every job's outcome is counted here, from its own conclusion whatever the batch's says.
+    assert _counted_jobs(sink) == {"ntp": "failed", "kafka": "skipped", "redis": "passed"}
     gathered_operations = [
         record
         for record in sink.records_named("operations.count")
@@ -504,33 +517,152 @@ def test_an_accepted_final_result_reports_the_batches_outcomes(tmp_path: Path):
     assert {record.value for record in sink.records_named("operations.failed")} == {0}
 
 
-def test_an_observed_attempt_the_commit_never_collected_reports_no_outcome(tmp_path: Path):
-    """An observed job is not a collected result, so the commit reports no outcome for it."""
+def test_a_cancelled_batch_is_cancelled_whatever_its_finished_jobs_did(tmp_path: Path):
+    """A finished job keeps its failure, but the batch and its unconfirmed jobs are cancelled."""
     monitoring, sink = recording_runtime()
-    j1 = _batch_job("j1")
-    j2 = _batch_job("j2", target="kafka")
-    gatherer = _make_gatherer(tmp_path, {"batch-1": [j1, j2]}, monitor=monitoring.component("test-gatherer"))
+    failed = _batch_job("j1")
+    job = _batch_job("j2", target="kafka")
+    gatherer = _make_gatherer(tmp_path, {"batch-1": [failed, job]}, monitor=monitoring.component("test-gatherer"))
 
-    gatherer.process_message(_progress_update(make_workflow_job(name="j2", status=WorkflowJobStatus.IN_PROGRESS)))
-    drain_queue(gatherer.bus.queue)
     artifacts = tmp_path / "artifacts" / "100"
-    j1_dir = _make_job_tree(artifacts, "j1", e2e=False)
+    failed_dir = _make_job_tree(artifacts, "j1", junit=JUNIT_FAILING, e2e=False)
+    job_dir = _make_job_tree(artifacts, "j2", e2e=False)
     gatherer.process_message(
         _batch_finished(
             artifacts,
+            status=Status.CANCELLED,
             batch_jobs=[
-                _batch_job_result(j1, make_workflow_job(name="j1", conclusion=WorkflowJobConclusion.SUCCESS), j1_dir)
+                _batch_job_result(
+                    failed, make_workflow_job(name="j1", conclusion=WorkflowJobConclusion.FAILURE), failed_dir
+                ),
+                _batch_job_result(job, None, job_dir),
             ],
         )
     )
-    drain_queue(gatherer.bus.queue)
 
-    reported = [record.tags["dispatcher.batch.job.target"] for record in sink.records_named("jobs.failed")]
-    assert reported == ["ntp"]
-    assert [record.value for record in sink.records_named("jobs.failed")] == [0]
-    assert [
-        (record.value, record.tags["dispatcher.batch.job.target"]) for record in sink.records_named("jobs.skipped")
-    ] == [(0, "ntp")]
+    [update] = drain_queue(gatherer.bus.queue)
+    assert update.progress.done
+    assert (update.progress.cancelled, update.progress.failed) == (1, 1)
+    assert [record.value for record in sink.records_named("batches.cancelled")] == [1]
+    assert [record.value for record in sink.records_named("batches.failed")] == [0]
+    # The finished job keeps its own failure; only the unconfirmed one follows the batch.
+    assert _counted_jobs(sink) == {"ntp": "failed", "kafka": "cancelled"}
+
+
+def test_a_batch_timed_out_by_its_job_reports_timed_out_and_fails(tmp_path: Path):
+    """GitHub calls a run cancelled by a job timeout `cancelled`; the batch times out and fails."""
+    monitoring, sink = recording_runtime()
+    job = _batch_job("j1")
+    gatherer = _make_gatherer(tmp_path, {"batch-1": [job]}, monitor=monitoring.component("test-gatherer"))
+
+    artifacts = tmp_path / "artifacts" / "100"
+    job_dir = _make_job_tree(artifacts, "j1", e2e=False)
+    gatherer.process_message(
+        _batch_finished(
+            artifacts,
+            # The runner reclassifies a run cancelled by a job timeout as a failure.
+            status=Status.FAILURE,
+            batch_jobs=[_batch_job_result(job, timed_out_job("j1"), job_dir)],
+        )
+    )
+
+    [update] = drain_queue(gatherer.bus.queue)
+    assert _batch_progress(update, "batch-1").status is Status.FAILURE
+    assert update.progress.failed == 1
+    assert [record.value for record in sink.records_named("batches.timed_out")] == [1]
+    assert [record.value for record in sink.records_named("batches.failed")] == [0]
+    assert [record.value for record in sink.records_named("batches.cancelled")] == [0]
+    # The job's own counter reports the timeout the batch's status had to fold into a failure.
+    assert _counted_jobs(sink) == {"ntp": "timed_out"}
+
+
+def test_a_real_failure_outranks_a_timeout_in_the_batch_outcome(tmp_path: Path):
+    """A batch that both timed out and really failed reports the failure, not the timeout."""
+    monitoring, sink = recording_runtime()
+    timed_out = _batch_job("j1")
+    failed = _batch_job("j2", target="kafka")
+    gatherer = _make_gatherer(tmp_path, {"batch-1": [timed_out, failed]}, monitor=monitoring.component("test-gatherer"))
+
+    artifacts = tmp_path / "artifacts" / "100"
+    timed_out_dir = _make_job_tree(artifacts, "j1", e2e=False)
+    failed_dir = _make_job_tree(artifacts, "j2", junit=JUNIT_FAILING, e2e=False)
+    gatherer.process_message(
+        _batch_finished(
+            artifacts,
+            status=Status.FAILURE,
+            batch_jobs=[
+                _batch_job_result(timed_out, timed_out_job("j1"), timed_out_dir),
+                _batch_job_result(
+                    failed, make_workflow_job(name="j2", conclusion=WorkflowJobConclusion.FAILURE), failed_dir
+                ),
+            ],
+        )
+    )
+
+    drain_queue(gatherer.bus.queue)
+    assert [record.value for record in sink.records_named("batches.failed")] == [1]
+    assert [record.value for record in sink.records_named("batches.timed_out")] == [0]
+    # Each job keeps its own outcome: only the batch's rolls them up by precedence.
+    assert _counted_jobs(sink) == {"ntp": "timed_out", "kafka": "failed"}
+
+
+def test_a_job_counted_at_observation_is_not_counted_again_at_gathering(tmp_path: Path):
+    """The polls' listings and the final message describe the same attempt, which counts once."""
+    monitoring, sink = recording_runtime()
+    job = _batch_job("j1")
+    gatherer = _make_gatherer(tmp_path, {"batch-1": [job]}, monitor=monitoring.component("test-gatherer"))
+    observed = make_workflow_job(name="j1", conclusion=WorkflowJobConclusion.FAILURE)
+    gatherer.process_message(_progress_update(observed, state=ExecutionState.ARTIFACT_DOWNLOAD, status=Status.FAILURE))
+
+    artifacts = tmp_path / "artifacts" / "100"
+    job_dir = _make_job_tree(artifacts, "j1", junit=JUNIT_FAILING, e2e=False)
+    gatherer.process_message(
+        _batch_finished(
+            artifacts,
+            status=Status.FAILURE,
+            batch_jobs=[_batch_job_result(job, observed, job_dir)],
+        )
+    )
+
+    assert [record.value for record in sink.records_named("jobs.failed")] == [1]
+    assert [record.value for record in sink.records_named("batches.failed")] == [1]
+    assert _counted_jobs(sink) == {"ntp": "failed"}
+
+
+def test_final_gathering_counts_jobs_never_observed_finished(tmp_path: Path):
+    """A job GitHub listed completed counts from its own conclusion; one it never confirmed from
+    its collected result and the run's.
+    """
+    monitoring, sink = recording_runtime()
+    confirmed = _batch_job("j1")
+    unconfirmed = _batch_job("j2", target="kafka")
+    gatherer = _make_gatherer(
+        tmp_path, {"batch-1": [confirmed, unconfirmed]}, monitor=monitoring.component("test-gatherer")
+    )
+
+    artifacts = tmp_path / "artifacts" / "100"
+    confirmed_dir = _make_job_tree(artifacts, "j1", e2e=False)
+    unconfirmed_dir = _make_job_tree(artifacts, "j2", junit=JUNIT_FAILING, e2e=False)
+    gatherer.process_message(
+        _batch_finished(
+            artifacts,
+            status=Status.FAILURE,
+            batch_jobs=[
+                _batch_job_result(
+                    confirmed, make_workflow_job(name="j1", conclusion=WorkflowJobConclusion.SUCCESS), confirmed_dir
+                ),
+                _batch_job_result(unconfirmed, None, unconfirmed_dir),
+            ],
+        )
+    )
+
+    drain_queue(gatherer.bus.queue)
+    assert _counted_jobs(sink) == {"ntp": "passed", "kafka": "failed"}
+    # The outcome counters stay on the planned dimensions; the attempt's own fields stay off them.
+    [sample] = [record for record in sink.records_named("jobs.passed") if record.value == 1]
+    assert "dispatcher.batch.job.id" not in sample.tags
+    assert sample.tags["dispatcher.component"] == "test-gatherer"
+    assert [record.value for record in sink.records_named("batches.failed")] == [1]
 
 
 def test_a_duplicate_final_message_does_not_report_the_batch_twice(tmp_path: Path):
@@ -550,9 +682,97 @@ def test_a_duplicate_final_message_does_not_report_the_batch_twice(tmp_path: Pat
     gatherer.process_message(batch)
     gatherer.process_message(dataclasses.replace(batch, id="replay"))
 
-    assert [record.value for record in sink.records_named("jobs.failed")] == [1]
     assert [record.value for record in sink.records_named("batches.failed")] == [1]
     assert [record.value for record in sink.records_named("operations.count")] == [1]
+
+
+def test_a_cancelled_shutdown_cancels_work_no_processor_settled(tmp_path: Path):
+    """A job the polls saw finished keeps its outcome; the rest is reported cancelled."""
+    monitoring, sink = recording_runtime()
+    finished, unfinished = _batch_job("j1"), _batch_job("j2", target="kafka")
+    gatherer = _make_gatherer(
+        tmp_path, {"batch-1": [finished, unfinished]}, monitor=monitoring.component("test-gatherer")
+    )
+    gatherer.process_message(_progress_update(make_workflow_job(name="j1")))
+
+    gatherer.report_unfinished([_launched(finished, unfinished)], cancelled=True)
+
+    assert _counted_jobs(sink) == {"ntp": "passed", "kafka": "cancelled"}
+    assert [record.value for record in sink.records_named("batches.cancelled")] == [1]
+    assert sink.records_named("jobs.incomplete") == []
+
+
+def test_a_cancelled_shutdown_keeps_a_gathered_batch_outcome(tmp_path: Path):
+    """A batch that reached gathering is settled; only the still-running one is cancelled."""
+    monitoring, sink = recording_runtime()
+    gathered_job, running_job = _batch_job("j1"), _batch_job("j2", target="kafka")
+    gatherer = _make_gatherer(
+        tmp_path, {"batch-1": [gathered_job], "batch-2": [running_job]}, monitor=monitoring.component("test-gatherer")
+    )
+    artifacts = tmp_path / "artifacts" / "100"
+    job_dir = _make_job_tree(artifacts, "j1")
+    gatherer.process_message(
+        _batch_finished(
+            artifacts,
+            batch_jobs=[
+                _batch_job_result(
+                    gathered_job, make_workflow_job(name="j1", conclusion=WorkflowJobConclusion.SUCCESS), job_dir
+                )
+            ],
+        )
+    )
+
+    gatherer.report_unfinished(
+        [_launched(gathered_job, batch_id="batch-1"), _launched(running_job, batch_id="batch-2", run_id=200)],
+        cancelled=True,
+    )
+
+    assert _counted_jobs(sink) == {"ntp": "passed", "kafka": "cancelled"}
+    # The gathered batch settled first; the still-running one is reported cancelled after it.
+    assert [record.value for record in sink.records_named("batches.passed")] == [1, 0]
+    assert [record.value for record in sink.records_named("batches.cancelled")] == [0, 1]
+
+
+def test_any_other_shutdown_flags_outstanding_jobs_incomplete(tmp_path: Path):
+    """A batch still running when the run stopped has its jobs flagged, not invented outcomes."""
+    monitoring, sink = recording_runtime()
+    finished, outstanding = _batch_job("j1"), _batch_job("j2", target="kafka")
+    never_launched = _batch_job("j3", target="redis")
+    gatherer = _make_gatherer(
+        tmp_path,
+        {"batch-1": [finished, outstanding], "batch-2": [never_launched]},
+        monitor=monitoring.component("test-gatherer"),
+    )
+    gatherer.process_message(_progress_update(make_workflow_job(name="j1")))
+
+    # The Dispatcher passes only launched batches, so the never-launched one is not accounted.
+    gatherer.report_unfinished([_launched(finished, outstanding)], cancelled=False)
+
+    incomplete = [
+        (record.value, record.tags["dispatcher.batch.job.target"]) for record in sink.records_named("jobs.incomplete")
+    ]
+    assert incomplete == [(0, "ntp"), (1, "kafka")]
+    assert sink.records_named("batches.cancelled") == []
+    assert "redis" not in _counted_jobs(sink)
+
+
+def test_reporting_unfinished_never_raises_into_shutdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The accounting runs inside a shutdown that must not be derailed by a metrics failure."""
+    handler = RecordingJsonHandler()
+    job = _batch_job("j1")
+    gatherer = _make_gatherer(tmp_path, handler=handler)
+
+    def fail_job_fields(job: BatchJob) -> dict:
+        raise ValueError("Cannot build job dimensions")
+
+    monkeypatch.setattr(task_test_gatherer, "job_fields", fail_job_fields)
+
+    gatherer.report_unfinished([_launched(job)], cancelled=False)
+
+    [error] = [event for event in handler.events if event["event"] == "Failed to report unfinished work"]
+    assert error["level"] == "error"
+    assert error["component"] == "test-gatherer"
+    assert "Cannot build job dimensions" in error["exception"]
 
 
 def test_failure_path_records_failed_steps_and_reports(tmp_path: Path):
@@ -893,6 +1113,15 @@ def test_malformed_junit_is_swallowed(tmp_path: Path):
         pytest.param(Status.FAILURE, None, JUNIT_FAILING, Status.FAILURE, id="failed-tests-in-artifacts"),
         pytest.param(Status.FAILURE, None, None, Status.INCONCLUSIVE, id="no-artifacts"),
         pytest.param(Status.FAILURE, WorkflowJobStatus.IN_PROGRESS, JUNIT_PASSING, Status.INCONCLUSIVE, id="stale-job"),
+        pytest.param(Status.CANCELLED, None, None, Status.CANCELLED, id="cancelled-run"),
+        pytest.param(
+            Status.CANCELLED,
+            WorkflowJobStatus.IN_PROGRESS,
+            JUNIT_PASSING,
+            Status.CANCELLED,
+            id="cancelled-run-stale-job",
+        ),
+        pytest.param(Status.CANCELLED, None, JUNIT_FAILING, Status.CANCELLED, id="cancelled-run-failed-tests"),
     ],
 )
 def test_an_unconfirmed_job_is_resolved_from_the_run_and_its_artifacts(
@@ -921,10 +1150,10 @@ def test_an_unconfirmed_job_is_resolved_from_the_run_and_its_artifacts(
     assert result.status is expected
     assert result.failed_steps == []
     [update] = drain_queue(gatherer.bus.queue)
-    assert (update.progress.passed, update.progress.failed, update.progress.inconclusive) == (
+    assert (update.progress.passed, update.progress.failed, update.progress.cancelled) == (
         expected is Status.SUCCESS,
         expected is Status.FAILURE,
-        expected is Status.INCONCLUSIVE,
+        expected is Status.CANCELLED,
     )
     warnings = [event for event in handler.events if "no confirmed final state" in event["event"]]
     [warning] = warnings

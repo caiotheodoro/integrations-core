@@ -6,11 +6,18 @@ from __future__ import annotations
 import dataclasses
 import shutil
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ddev.cli.ci.tests.dispatcher_attributes import job_fields
-from ddev.cli.ci.tests.execution_metrics import MetricsHelper, Operation
+from ddev.cli.ci.tests.execution_metrics import (
+    MetricsHelper,
+    Operation,
+    ResultMetric,
+    report_result,
+    result_metric,
+)
 from ddev.cli.ci.tests.messages import (
     BatchFinished,
     BatchJob,
@@ -28,7 +35,7 @@ from ddev.cli.ci.tests.progress import (
     JobProgress,
     ProgressError,
 )
-from ddev.cli.ci.tests.status import Status, conclusion_to_status
+from ddev.cli.ci.tests.status import Status, job_status, timed_out
 from ddev.event_bus.orchestrator import SyncProcessor
 from ddev.monitoring import ComponentMonitor
 from ddev.utils.github_async.models.workflow import WorkflowJobStatus
@@ -66,6 +73,25 @@ def _has_failed_tests(reports: tuple[JUnitReport, ...]) -> bool:
     )
 
 
+def _job_result(result: JobResult, attempt: JobAttemptProgress) -> ResultMetric:
+    """A finished attempt's metric result: a timeout is split from its failure status."""
+    return result_metric(result.status, timed_out=attempt.timed_out)
+
+
+def _batch_result(message: BatchFinished, gathered: list[tuple[JobResult, JobAttemptProgress]]) -> ResultMetric:
+    """A cancelled batch is cancelled whatever its finished jobs did. Otherwise a job failure outranks
+    a job timeout, which outranks the workflow's own status.
+    """
+    if message.status is Status.CANCELLED:
+        return ResultMetric.CANCELLED
+    results = [_job_result(result, attempt) for result, attempt in gathered]
+    if ResultMetric.FAILED in results:
+        return ResultMetric.FAILED
+    if ResultMetric.TIMED_OUT in results:
+        return ResultMetric.TIMED_OUT
+    return result_metric(message.status)
+
+
 class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
     """Publishes changed execution snapshots and enriches them with gathered coverage and JUnit results.
 
@@ -90,6 +116,10 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
         self._progress_by_batch: dict[str, BatchProgress] = {
             batch.batch_id: self._planned_batch(batch) for batch in batches
         }
+        # Outcome counters already emitted, under `self._lock`. One per planned job, so each job's
+        # outcomes add up to its `jobs.count`.
+        self._reported_batches: set[str] = set()
+        self._reported_jobs: dict[str, set[str]] = {}
         self._lock = threading.Lock()
         self._logger = monitor.logger
         self.monitor = monitor
@@ -171,7 +201,7 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
             finished = self._finished_batch_progress(planned, message, gathered)
             self._progress_by_batch[message.batch_id] = finished
             update = self._publish_update(message.id)
-            self._report_final_result(finished)
+            self._report_final_result(message, gathered)
 
         self._logger.info(
             "Batch %s results gathered: report revision %s (done=%s)",
@@ -181,21 +211,22 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
         )
         return True
 
-    def _report_final_result(self, progress: BatchProgress) -> None:
-        """Count collected results, not attempts only observed through polling.
+    def _report_final_result(
+        self, message: BatchFinished, gathered: list[tuple[JobResult, JobAttemptProgress]]
+    ) -> None:
+        """Count the batch's and its jobs' outcomes. A job already counted at observation is skipped.
 
-        Passed and failed are counted together at gathering, not against `batches.count` at launch,
-        so both land in the same time bucket for the same batch.
+        Hold `self._lock`.
         """
         metrics = self.monitor.metrics
-        metrics.count('batches.passed', int(progress.status == Status.SUCCESS))
-        metrics.count('batches.failed', int(progress.status == Status.FAILURE))
-        for job_progress in progress.jobs_progress:
-            latest = job_progress.collected_result
-            if latest is None:
+        reported = self._reported_jobs.setdefault(message.batch_id, set())
+        for batch_job_result, (result, attempt) in zip(message.batch_jobs, gathered, strict=True):
+            if batch_job_result.job.name in reported:
                 continue
-            metrics.count('jobs.failed', int(latest.status is Status.FAILURE), **job_fields(job_progress.job))
-            metrics.count('jobs.skipped', int(latest.status is Status.SKIPPED), **job_fields(job_progress.job))
+            reported.add(batch_job_result.job.name)
+            report_result(metrics, 'jobs', _job_result(result, attempt), **job_fields(batch_job_result.job))
+        report_result(metrics, 'batches', _batch_result(message, gathered))
+        self._reported_batches.add(message.batch_id)
 
     def _observe_progress(self, message: BatchProgressUpdate) -> None:
         with self._lock:
@@ -207,9 +238,27 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
 
             previous = self._snapshot()
             self._progress_by_batch[message.batch_id] = self._updated_batch_progress(current, message)
+            self._report_observed_results(message.batch_id)
             # Repeated polls should not trigger identical PR comment updates.
             if self._snapshot() != previous:
                 self._publish_update(message.id)
+
+    def _report_observed_results(self, batch_id: str) -> None:
+        """Count each job at the first observation showing it finished. Hold `self._lock`."""
+        reported = self._reported_jobs.setdefault(batch_id, set())
+        for job in self._progress_by_batch[batch_id].jobs_progress:
+            latest = job.latest
+            if latest is None or latest.state is not ExecutionState.FINISHED or latest.status is None:
+                continue
+            if job.job.name in reported:
+                continue
+            reported.add(job.job.name)
+            report_result(
+                self.monitor.metrics,
+                'jobs',
+                result_metric(latest.status, timed_out=latest.timed_out),
+                **job_fields(job.job),
+            )
 
     def _accept_progress(self, current: BatchProgress, message: BatchProgressUpdate) -> bool:
         """Called with the gatherer lock held."""
@@ -263,7 +312,7 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
             if latest.state is ExecutionState.RUNNING and state is ExecutionState.QUEUED:
                 return job
         finished = state is ExecutionState.FINISHED
-        status = conclusion_to_status(workflow_job.conclusion) if finished else None
+        status = job_status(workflow_job) if finished else None
         attempt = JobAttemptProgress(
             attempt=1,
             job_id=workflow_job.id,
@@ -273,6 +322,7 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
             failed_steps=tuple(step.name for step in workflow_job.steps if finished and step.conclusion == "failure"),
             job_url=workflow_job.html_url,
             reports=None,
+            timed_out=timed_out(workflow_job),
         )
         return self._record_attempt(job, attempt, same_run=True)
 
@@ -317,6 +367,28 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
         """The current aggregate snapshot, for a caller outside the message flow."""
         with self._lock:
             return self._snapshot()
+
+    def report_unfinished(self, dispatched: Iterable[TestBatch], *, cancelled: bool) -> None:
+        """Account for dispatched work that has no outcome yet, without raising into shutdown.
+
+        A cancelled shutdown counts it as cancelled; any other flags its jobs incomplete. The caller
+        passes the dispatched batches because a shutdown race can drop the dispatch's progress update.
+        """
+        try:
+            with self._lock:
+                metrics = self.monitor.metrics
+                for batch in dispatched:
+                    reported = self._reported_jobs.get(batch.batch_id, set())
+                    if cancelled and batch.batch_id not in self._reported_batches:
+                        report_result(metrics, 'batches', ResultMetric.CANCELLED)
+                    for job in batch.job_list:
+                        if cancelled:
+                            if job.name not in reported:
+                                report_result(metrics, 'jobs', ResultMetric.CANCELLED, **job_fields(job))
+                        else:
+                            metrics.count('jobs.incomplete', int(job.name not in reported), **job_fields(job))
+        except Exception:
+            self._logger.exception("Failed to report unfinished work")
 
     def _snapshot(self, done: bool | None = None) -> DispatcherProgress:
         """Build the reconciled aggregate while holding the lock, deriving *done* unless supplied."""
@@ -398,6 +470,7 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
             job_url=job_url,
             reports=reports,
             error=error,
+            timed_out=workflow_job is not None and timed_out(workflow_job),
         )
         return (result, attempt)
 
@@ -429,7 +502,7 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
         workflow_job = batch_job_result.workflow_job
         if workflow_job is not None and workflow_job.status is WorkflowJobStatus.COMPLETED:
             failed_steps = [step.name for step in workflow_job.steps if step.conclusion == "failure"]
-            return (conclusion_to_status(workflow_job.conclusion), failed_steps)
+            return (job_status(workflow_job), failed_steps)
 
         return (self._unconfirmed_job_status(batch_job_result, message, reports), [])
 
@@ -440,16 +513,19 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
 
         GitHub concludes a run `success` only when no job failed, so a successful run clears an
         unconfirmed job. Otherwise the artifacts are the remaining evidence: failed or errored
-        tests mean the job failed, and anything else is inconclusive, because the job may have
-        failed outside its tests (e.g. in setup) or never produced reports.
+        tests mean the job failed, and anything else is inconclusive, because the job may have failed
+        outside its tests (e.g. in setup) or never produced reports. A cancelled run is checked
+        first: whatever it left unfinished is discarded, failing reports included.
         """
         if message.status is Status.SUCCESS:
             status, reason = Status.SUCCESS, "the workflow run succeeded"
+        elif message.status is Status.CANCELLED:
+            status, reason = Status.CANCELLED, "the workflow run was cancelled"
         elif _has_failed_tests(reports):
             status, reason = Status.FAILURE, "its artifacts hold failed tests"
         else:
             status, reason = Status.INCONCLUSIVE, "the run did not succeed and no test failed"
-        # Inferred, not observed: the runner already reports every finish GitHub listed.
+        # Inferred, not observed: no listing ever showed this attempt's own finish.
         self._logger.warning(
             "Job %s has no confirmed final state: reported as %s (%s)",
             batch_job_result.job.name,
@@ -541,6 +617,7 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
         success_count = sum(1 for result in results if result.status == Status.SUCCESS)
         failed_count = sum(1 for result in results if result.status == Status.FAILURE)
         skipped_count = sum(1 for result in results if result.status == Status.SKIPPED)
+        cancelled_count = sum(1 for result in results if result.status == Status.CANCELLED)
         return WorkflowStatus(
             batch_id=message.batch_id,
             url=message.workflow_url,
@@ -548,5 +625,6 @@ class TaskTestGatherer(SyncProcessor[BatchFinished | BatchProgressUpdate]):
             success_count=success_count,
             failed_count=failed_count,
             skipped_count=skipped_count,
+            cancelled_count=cancelled_count,
             results=results,
         )

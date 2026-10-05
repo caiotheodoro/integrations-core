@@ -36,7 +36,6 @@ from ddev.cli.ci.tests.dispatcher_config import DispatcherConfig
 from ddev.cli.ci.tests.execution_metrics import ExecutionOutcome
 from ddev.cli.ci.tests.messages import (
     BatchFinished,
-    BatchJob,
     BatchProgressUpdate,
     TestBatch,
     UpdatePRComment,
@@ -75,12 +74,14 @@ from tests.cli.ci.tests.helpers import (
     make_batch,
     make_job,
     recording_runtime,
+    timed_out_job,
 )
 from tests.helpers.github_async import (
     DEFAULT_COMMENT_ID,
     DEFAULT_DISPATCH_HTML_URL,
     FakeAsyncGitHubClient,
     make_artifacts_list,
+    make_response,
     make_workflow_dispatch_result,
     make_workflow_job,
     make_workflow_jobs_list,
@@ -102,6 +103,8 @@ CONTEXT = ResolvedRun(
     base_branch="master",
     base_sha="base-sha",
 )
+
+TIMED_OUT = ShutdownRequest.timed_out(RuntimeError('the run reached its time limit'))
 
 
 def build_bus(
@@ -322,6 +325,82 @@ def test_a_failed_batch_is_a_test_failure(client, tmp_path):
     assert outcome is not None
     assert outcome.execution_outcome is ExecutionOutcome.TESTS_FAILED
     assert outcome.progress.failed == 1
+
+
+@pytest.mark.parametrize("client", ["cancelled"], indirect=True)
+def test_a_cancelled_batch_ends_the_run_cancelled(client, tmp_path):
+    """A superseded run's batches conclude cancelled; the run is cancelled, not failed.
+
+    This is the run that observes its batch cancelled before it is cancelled itself.
+    """
+    job = make_job()
+    mock_job_result(client, job, "cancelled")
+    dispatcher = build_bus(client, tmp_path, [make_batch(job)])
+
+    dispatcher.run()
+
+    outcome = dispatcher.outcome
+    assert outcome is not None
+    assert outcome.execution_outcome is ExecutionOutcome.CANCELLED
+    assert outcome.shutdown is None
+    assert outcome.progress.done
+    assert (outcome.progress.cancelled, outcome.progress.failed) == (1, 0)
+    # The same heading a shutdown-cancelled run uses, so the comment reads the same either way.
+    assert CANCELLED_HEADING in client.last_call("update_issue_comment").kwargs["body"]
+
+
+@pytest.mark.parametrize("client", ["cancelled"], indirect=True)
+def test_a_batch_timed_out_by_its_job_fails_the_run(client, tmp_path):
+    """A run cancelled because a job hit its timeout is a failure, not a cancellation."""
+    job = make_job()
+    client.mock_response("list_workflow_jobs", make_workflow_jobs_list([timed_out_job(job.name)]))
+    dispatcher = build_bus(client, tmp_path, [make_batch(job)])
+
+    dispatcher.run()
+
+    outcome = dispatcher.outcome
+    assert outcome is not None
+    assert outcome.execution_outcome is ExecutionOutcome.TESTS_FAILED
+    assert outcome.progress.failed == 1
+    assert outcome.progress.cancelled == 0
+    assert CANCELLED_HEADING not in client.last_call("update_issue_comment").kwargs["body"]
+
+
+@pytest.mark.parametrize("client", ["failure"], indirect=True)
+def test_a_failed_batch_outranks_a_cancelled_one(client, tmp_path):
+    """A real test failure keeps the run `tests-failed` even when another batch was cancelled."""
+    failed_job = make_job("job-1")
+    cancelled_job = make_job("job-2", target="kafka")
+    mock_job_result(client, failed_job, "failure")
+    # Each dispatch gets its own run; the second is the one a superseding push left cancelled.
+    for run_id in (123, 456):
+        client.mock_response(
+            "create_workflow_dispatch",
+            make_response(make_workflow_dispatch_result(workflow_run_id=run_id)),
+            once=True,
+        )
+    client.mock_response(
+        "get_workflow_run",
+        make_workflow_run(id=456, conclusion="cancelled"),
+        run_id=456,
+    )
+    client.mock_response(
+        "list_workflow_jobs",
+        make_workflow_jobs_list([make_workflow_job(name=cancelled_job.name, conclusion="cancelled")]),
+        run_id=456,
+    )
+    dispatcher = build_bus(
+        client,
+        tmp_path,
+        [make_batch(failed_job), make_batch(cancelled_job, batch_id="batch-02")],
+    )
+
+    dispatcher.run()
+
+    outcome = dispatcher.outcome
+    assert outcome is not None
+    assert outcome.execution_outcome is ExecutionOutcome.TESTS_FAILED
+    assert (outcome.progress.failed, outcome.progress.cancelled) == (1, 1)
 
 
 @pytest.mark.parametrize("client", ["failure"], indirect=True)
@@ -586,7 +665,8 @@ def test_a_comment_write_failure_does_not_prevent_remote_cancellation(
     assert outcome.execution_outcome is ExecutionOutcome.CANCELLED
 
 
-def test_a_cancelled_run_counts_its_uncollected_jobs_as_incomplete(client: FakeAsyncGitHubClient, tmp_path: Path):
+def test_a_cancelled_run_reports_its_unfinished_work_as_cancelled(client: FakeAsyncGitHubClient, tmp_path: Path):
+    """A cancelled run reports its unfinished work as cancelled, never incomplete or failed."""
     monitoring, sink = recording_runtime()
     dispatcher = build_bus(client, tmp_path, [make_batch(make_job())], monitoring=monitoring)
     a_run_that_never_finishes(client)
@@ -603,12 +683,75 @@ def test_a_cancelled_run_counts_its_uncollected_jobs_as_incomplete(client: FakeA
     assert [record.value for record in sink.records_named('runs.count')] == [1]
     assert [record.value for record in sink.records_named('runs.cancelled')] == [1]
     assert [record.value for record in sink.records_named('runs.failed')] == [0]
-    incomplete = sink.records_named('jobs.incomplete')
-    assert [record.value for record in incomplete] == [1]
-    assert incomplete[0].tags['dispatcher.batch.job.target'] == 'ntp'
-    assert incomplete[0].tags['dispatcher.component'] == 'dispatcher'
-    assert sink.records_named('jobs.failed') == []
-    assert sink.records_named('batches.failed') == []
+    assert [record.value for record in sink.records_named('batches.cancelled')] == [1]
+    assert [record.value for record in sink.records_named('batches.failed')] == [0]
+    assert [record.value for record in sink.records_named('jobs.cancelled')] == [1]
+    assert [record.value for record in sink.records_named('jobs.failed')] == [0]
+    assert sink.records_named('jobs.incomplete') == []
+
+
+def stop_after_the_first_poll(
+    dispatcher: Dispatcher, client: FakeAsyncGitHubClient, *, request: ShutdownRequest
+) -> None:
+    """Request a shutdown on the second poll, once the gatherer's thread has seen a job finish."""
+    got_workflow_run = client.get_workflow_run
+    polls = 0
+
+    async def stop_on_a_later_poll(owner: str, repo: str, run_id: int) -> GitHubResponse[WorkflowRun]:
+        nonlocal polls
+        response = await got_workflow_run(owner, repo, run_id)
+        polls += 1
+        if polls > 1:
+            for _ in range(500):
+                if dispatcher._gatherer.progress.complete:
+                    break
+                await asyncio.sleep(0.01)
+            dispatcher.request_shutdown(request)
+        return response
+
+    client.get_workflow_run = stop_on_a_later_poll
+
+
+def test_a_cancelled_run_keeps_reported_work_and_cancels_the_rest(client: FakeAsyncGitHubClient, tmp_path: Path):
+    """Only work nothing else accounted for becomes cancelled; finished jobs keep their outcome."""
+    monitoring, sink = recording_runtime()
+    reported, unreported = make_job("j1"), make_job("j2", target="kafka")
+    dispatcher = build_bus(client, tmp_path, [make_batch(reported, unreported)], monitoring=monitoring)
+    a_run_that_never_finishes(client)
+    # The run never finishes, but its first poll lists one job already completed.
+    client.mock_response("list_workflow_jobs", make_workflow_jobs_list([make_workflow_job(name="j1")]))
+    stop_after_the_first_poll(dispatcher, client, request=ShutdownRequest.cancelled())
+
+    dispatcher.run()
+
+    assert dispatcher.cancelled
+    counted = {
+        record.tags['dispatcher.batch.job.target']: record.name
+        for record in sink.records
+        if record.name.startswith('jobs.') and record.value == 1
+    }
+    # The finished job keeps its outcome; only the one never observed becomes cancelled.
+    assert counted == {'ntp': 'jobs.passed', 'kafka': 'jobs.cancelled'}
+    assert [record.value for record in sink.records_named('batches.cancelled')] == [1]
+    assert [record.value for record in sink.records_named('batches.passed')] == [0]
+    assert sink.records_named('jobs.incomplete') == []
+
+
+def test_a_job_observed_finished_is_not_incomplete_at_shutdown(client: FakeAsyncGitHubClient, tmp_path: Path):
+    """A job whose outcome was counted is not outstanding, even when its batch never gathered."""
+    monitoring, sink = recording_runtime()
+    reported, unreported = make_job("j1"), make_job("j2", target="kafka")
+    dispatcher = build_bus(client, tmp_path, [make_batch(reported, unreported)], monitoring=monitoring)
+    a_run_that_never_finishes(client)
+    client.mock_response("list_workflow_jobs", make_workflow_jobs_list([make_workflow_job(name="j1")]))
+    stop_after_the_first_poll(dispatcher, client, request=TIMED_OUT)
+
+    dispatcher.run()
+
+    incomplete = [
+        (record.value, record.tags['dispatcher.batch.job.target']) for record in sink.records_named('jobs.incomplete')
+    ]
+    assert incomplete == [(0, 'ntp'), (1, 'kafka')]
 
 
 def test_a_timed_out_run_is_counted_only_as_timed_out_with_its_jobs_incomplete(
@@ -635,37 +778,45 @@ def test_a_timed_out_run_is_counted_only_as_timed_out_with_its_jobs_incomplete(
     assert sink.records_named('jobs.failed') == []
 
 
-@pytest.mark.parametrize('cancelled', [False, True], ids=['completed', 'cancelled'])
+@pytest.mark.parametrize('stopped', [False, True], ids=['completed', 'timed-out'])
 def test_accounting_errors_allow_final_reporting_and_remote_cleanup(
-    client: FakeAsyncGitHubClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancelled: bool
+    client: FakeAsyncGitHubClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stopped: bool
 ):
     handler = RecordingJsonHandler()
     monitoring = MonitoringRuntime(console_handler=handler)
     job = make_job()
     dispatcher = build_bus(client, tmp_path, [make_batch(job)], monitoring=monitoring)
 
-    def fail_job_fields(job: BatchJob) -> dict[str, Any]:
-        raise ValueError('Cannot build job dimensions')
+    # The incomplete flag is the shutdown accounting's own emission, so failing it leaves the run
+    # itself untouched.
+    metrics = dispatcher._gatherer.monitor.metrics
+    real_count = metrics.count
 
-    monkeypatch.setattr(dispatcher_module, 'job_fields', fail_job_fields)
-    if cancelled:
+    def fail_incomplete(name: str, value: float, **tags: Any) -> None:
+        if name == 'jobs.incomplete':
+            raise ValueError('Cannot count incomplete jobs')
+        real_count(name, value, **tags)
+
+    monkeypatch.setattr(metrics, 'count', fail_incomplete)
+    if stopped:
         a_run_that_never_finishes(client)
-        stop_from_inside_the_run(dispatcher, client, request=ShutdownRequest.cancelled())
+        stop_from_inside_the_run(dispatcher, client, request=TIMED_OUT)
     else:
         mock_job_result(client, job, 'success')
         dispatcher.run()
 
     outcome = dispatcher.outcome
     assert outcome is not None
-    assert outcome.execution_outcome is (ExecutionOutcome.CANCELLED if cancelled else ExecutionOutcome.PASSED)
-    if cancelled:
-        assert CANCELLED_HEADING in client.last_call('update_issue_comment').kwargs['body']
+    assert outcome.execution_outcome is (ExecutionOutcome.TIMED_OUT if stopped else ExecutionOutcome.PASSED)
+    if stopped:
+        assert TIMED_OUT_HEADING in client.last_call('update_issue_comment').kwargs['body']
     else:
         assert outcome.final_report_published
-    assert [call.kwargs['run_id'] for call in client.calls_to('cancel_workflow_run')] == ([123] if cancelled else [])
-    [error] = [event for event in handler.events if event['event'] == 'Failed to report incomplete jobs']
+    assert [call.kwargs['run_id'] for call in client.calls_to('cancel_workflow_run')] == ([123] if stopped else [])
+    [error] = [event for event in handler.events if event['event'] == 'Failed to report unfinished work']
     assert error['level'] == 'error'
-    assert 'Cannot build job dimensions' in error['exception']
+    assert error['component'] == 'test-gatherer'
+    assert 'Cannot count incomplete jobs' in error['exception']
 
 
 def test_a_cleanup_failure_keeps_the_collected_accounting(
@@ -681,7 +832,7 @@ def test_a_cleanup_failure_keeps_the_collected_accounting(
     monkeypatch.setattr(dispatcher, '_shutdown_cleanup', fail_cleanup)
 
     with pytest.raises(asyncio.CancelledError):
-        stop_from_inside_the_run(dispatcher, client, request=ShutdownRequest.cancelled())
+        stop_from_inside_the_run(dispatcher, client, request=TIMED_OUT)
 
     assert dispatcher.outcome is None
     assert [record.value for record in sink.records_named('jobs.count')] == [1]
@@ -697,7 +848,7 @@ def test_shutdown_before_progress_counts_only_launched_jobs(client: FakeAsyncGit
     ]
     dispatcher = build_bus(client, tmp_path, batches, monitoring=monitoring)
 
-    stop_from_inside_the_run(dispatcher, client, request=ShutdownRequest.cancelled())
+    stop_from_inside_the_run(dispatcher, client, request=TIMED_OUT)
 
     assert dispatcher.outcome is not None
     assert {batch.state for batch in dispatcher.outcome.progress.batches} == {ExecutionState.PLANNED}
@@ -715,17 +866,19 @@ def test_a_jobs_dimensions_stay_identical_from_launch_to_terminal_accounting(
 ):
     monitoring, sink = recording_runtime()
     job = make_job()
-    mock_job_result(client, job, 'success')
+    # The listing never answers, so the job's outcome is resolved from the run's conclusion at gathering.
+    client.mock_response('list_workflow_jobs', RuntimeError('Final job metadata unavailable'))
     dispatcher = build_bus(client, tmp_path, [make_batch(job)], monitoring=monitoring)
 
     dispatcher.run()
 
     records = {
         name: next(record for record in sink.records_named(name))
-        for name in ('jobs.count', 'jobs.failed', 'jobs.skipped', 'jobs.incomplete')
+        for name in ('jobs.count', 'jobs.passed', 'jobs.incomplete')
     }
+    # The runner counts the launch, the gatherer the outcome and the shutdown accounting.
     components = {record.tags['dispatcher.component'] for record in records.values()}
-    assert components == {'test-runner', 'test-gatherer', 'dispatcher'}
+    assert components == {'test-runner', 'test-gatherer'}
     shared = {
         tuple(sorted((key, value) for key, value in record.tags.items() if key != 'dispatcher.component'))
         for record in records.values()

@@ -9,7 +9,14 @@ from collections.abc import Callable
 
 import pytest
 
-from ddev.cli.ci.tests.execution_metrics import MetricsHelper, Operation
+from ddev.cli.ci.tests.execution_metrics import (
+    MetricsHelper,
+    Operation,
+    ResultMetric,
+    report_result,
+    result_metric,
+)
+from ddev.cli.ci.tests.status import Status
 from ddev.monitoring.metrics import MetricKind
 from tests.cli.ci.tests.helpers import recording_runtime
 from tests.helpers.clock import FakeClock
@@ -25,6 +32,33 @@ def helper_with_sink(clock: Callable[[], float]) -> tuple[MetricsHelper, Recordi
 
 def values(sink: RecordingSink, name: str) -> list[float]:
     return [record.value for record in sink.records_named(name)]
+
+
+@pytest.mark.parametrize(
+    ('status', 'timed_out', 'expected'),
+    [
+        pytest.param(Status.SUCCESS, False, ResultMetric.PASSED, id='passed'),
+        pytest.param(Status.FAILURE, False, ResultMetric.FAILED, id='failed'),
+        pytest.param(Status.SKIPPED, False, ResultMetric.SKIPPED, id='skipped'),
+        pytest.param(Status.CANCELLED, False, ResultMetric.CANCELLED, id='cancelled'),
+        pytest.param(Status.INCONCLUSIVE, False, ResultMetric.INCONCLUSIVE, id='inconclusive'),
+        pytest.param(Status.FAILURE, True, ResultMetric.TIMED_OUT, id='timed-out'),
+    ],
+)
+def test_result_metric(status: Status, timed_out: bool, expected: ResultMetric):
+    """The one mapping from a status, with a timeout split off, to its counter's name."""
+    assert result_metric(status, timed_out=timed_out) is expected
+
+
+def test_report_result_emits_the_whole_family_with_exactly_one_1():
+    """Dense 0/1 counters, so a monitor sees zeros where an outcome did not land, not gaps."""
+    monitoring, sink = recording_runtime()
+
+    report_result(monitoring.component('test-runner').metrics, 'jobs', ResultMetric.TIMED_OUT, target='ntp')
+
+    for result in ResultMetric:
+        assert values(sink, f'jobs.{result.value}') == [int(result is ResultMetric.TIMED_OUT)]
+    assert sink.records_named('jobs.timed_out')[0].tags['dispatcher.batch.job.target'] == 'ntp'
 
 
 @pytest.mark.parametrize('failed', [False, True], ids=['settled-healthy', 'settled-failed'])

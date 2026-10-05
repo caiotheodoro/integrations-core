@@ -21,7 +21,13 @@ from ddev.cli.ci.tests.dispatcher_attributes import batch_fields, job_fields, te
 from ddev.cli.ci.tests.execution_metrics import MetricsHelper, Operation
 from ddev.cli.ci.tests.messages import BatchFinished, BatchJob, BatchJobResult, BatchProgressUpdate, TestBatch
 from ddev.cli.ci.tests.progress import ExecutionState
-from ddev.cli.ci.tests.status import Status, conclusion_to_status, has_started_running, is_queued
+from ddev.cli.ci.tests.status import (
+    Status,
+    batch_status,
+    has_started_running,
+    is_queued,
+    job_status,
+)
 from ddev.event_bus.exceptions import FatalProcessingError
 from ddev.event_bus.orchestrator import AsyncProcessor
 from ddev.monitoring import ComponentMonitor
@@ -227,7 +233,7 @@ class TaskTestRunner(AsyncProcessor[TestBatch]):
         )
         jobs = await self._reconcile_final_jobs(run_id, message, jobs)
         batch_jobs = BatchJobResult.correlate(message.job_list, jobs, artifact_dirs)
-        status = conclusion_to_status(conclusion)
+        status = batch_status(conclusion, jobs)
         self.submit_message(
             BatchFinished(
                 id=message.id,
@@ -292,7 +298,8 @@ class TaskTestRunner(AsyncProcessor[TestBatch]):
             self.monitor.metrics.distribution('job.queue.duration', duration, **job_fields(job))
 
     def _report_finished_jobs(self, batch: TestBatch, observed: Iterable[WorkflowJob]) -> None:
-        """Report each planned job's finish once per GitHub job ID, at the first listing showing it completed.
+        """Report each planned job's duration and completion once per GitHub job ID, at the first listing
+        showing it completed.
 
         Unusable timing is not retried on a later listing.
         """
@@ -310,8 +317,12 @@ class TaskTestRunner(AsyncProcessor[TestBatch]):
             duration = fields.get('job_duration_seconds')
             if duration is not None:
                 self.monitor.metrics.distribution('job.duration', duration, **fields)
-            status = conclusion_to_status(workflow_job.conclusion)
-            log = self._logger.info if status in (Status.SUCCESS, Status.SKIPPED) else self._logger.warning
+            status = job_status(workflow_job)
+            log = (
+                self._logger.info
+                if status in (Status.SUCCESS, Status.SKIPPED, Status.CANCELLED)
+                else self._logger.warning
+            )
             summary = status.value if duration is None else f"{status.value} in {duration:g}s"
             log("Job %s completed: %s", job.name, summary, **fields)
 
@@ -426,7 +437,7 @@ class TaskTestRunner(AsyncProcessor[TestBatch]):
             run_id=run_id,
             workflow_url=run.html_url,
             state=state,
-            status=conclusion_to_status(run.conclusion) if run.is_completed else None,
+            status=batch_status(run.conclusion, known_jobs.values()) if run.is_completed else None,
             sequence=sequence,
             jobs=tuple(known_jobs.values()),
         )
